@@ -11,6 +11,11 @@ body { margin: 0; background: #f4f0e8; }
 .script-card { border: 1px solid rgba(45,38,32,.1) !important; }
 .segment-row { border: 1px solid rgba(45,38,32,.1); border-radius: 14px; padding: 12px; background: #fff; }
 .segment-row.locked { background: #f2f7f3; border-color: #8ab09a; }
+.segment-row.stale { background: #fdf4f3; border-color: #d98a84; }
+.version-line { background: rgba(45,38,32,.04); }
+.source-select { max-width: 320px; min-width: 220px; flex: 1 1 220px; }
+.publish-blocker-row { cursor: pointer; }
+.publish-blocker-row:hover { background: rgba(45,38,32,.04); }
 .preview-frame { margin: 0 auto; background: #fff; border: 10px solid #1f1b18; border-radius: 18px; transition: max-width .25s ease; box-shadow: 0 20px 50px rgba(22,18,15,.18); }
 .preview-frame.desktop { max-width: 920px; border-radius: 12px; }
 .preview-frame.tablet { max-width: 720px; }
