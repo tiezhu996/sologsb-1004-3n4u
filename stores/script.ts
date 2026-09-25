@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
+import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, PublishBlocker, ScriptStatus, Segment, SegmentSyncState, VersionSnapshot } from '~/types'
 
 export const LANGUAGES: Language[] = [
   { id: 'zh', code: 'zh-CN', label: '简体中文', shortLabel: '中' },
@@ -7,7 +7,44 @@ export const LANGUAGES: Language[] = [
   { id: 'ja', code: 'ja-JP', label: '日本語', shortLabel: '日' }
 ]
 
+/** 原文（源语言）固定为中文，其余语言稿件均为译文 */
+export const SOURCE_LANGUAGE_ID = 'zh'
+
 const STORAGE_KEY = 'museum-script-studio-v1'
+
+/** 由译文段落的对应关系与中文原文当前版本推导同步状态，撤销/恢复后自动重算 */
+export function segmentSyncState(segment: Segment, sourceSegments: Segment[]): SegmentSyncState {
+  if (!segment.source) return 'unlinked'
+  const source = sourceSegments.find(item => item.id === segment.source!.sourceSegmentId)
+  if (!source) return 'source-missing'
+  if ((source.revision ?? 1) !== segment.source.sourceRevision) return 'pending'
+  if (!segment.source.verified) return 'unverified'
+  return 'verified'
+}
+
+const isStale = (state: SegmentSyncState) => state === 'pending' || state === 'source-missing'
+
+/** 为旧数据补齐原文版本号，并按段落顺序为译文建立初始对应关系（未核对） */
+function migrate(data: PersistedState) {
+  for (const exhibit of data.exhibits) {
+    const source = exhibit.drafts.find(draft => draft.languageId === SOURCE_LANGUAGE_ID)
+    if (source) {
+      for (const segment of source.segments) {
+        if (typeof segment.revision !== 'number') segment.revision = 1
+      }
+    }
+    for (const draft of exhibit.drafts) {
+      if (draft.languageId === SOURCE_LANGUAGE_ID || !source) continue
+      draft.segments.forEach((segment, index) => {
+        const counterpart = source.segments[index]
+        if (!segment.source && counterpart) {
+          segment.source = { sourceSegmentId: counterpart.id, sourceRevision: counterpart.revision ?? 1, verified: false, verifiedAt: '' }
+        }
+      })
+    }
+  }
+  if (typeof data.lastPublishedAt !== 'string') data.lastPublishedAt = ''
+}
 
 const segments = (prefix: string, values: Array<[string, string, boolean?]>): Segment[] => values.map(([label, content, locked], index) => ({
   id: `${prefix}-${index + 1}`,
@@ -110,7 +147,8 @@ function demoState(): PersistedState {
     selectedHallId: halls[0].id,
     selectedExhibitId: exhibits[0].id,
     selectedLanguageId: 'zh',
-    lastSavedAt: new Date().toISOString()
+    lastSavedAt: new Date().toISOString(),
+    lastPublishedAt: ''
   }
 }
 
@@ -123,6 +161,7 @@ export const useScriptStore = defineStore('museum-script', {
     selectedExhibitId: '',
     selectedLanguageId: 'zh',
     lastSavedAt: '',
+    lastPublishedAt: '',
     hydrated: false,
     past: [] as string[],
     future: [] as string[],
@@ -144,6 +183,44 @@ export const useScriptStore = defineStore('museum-script', {
     wordCount(): number {
       return (this.selectedDraft?.narration || '').replace(/\s/g, '').length
     },
+    /** 当前展项的中文原文段落，作为译文对应关系的候选 */
+    selectedSourceSegments(): Segment[] {
+      return this.selectedExhibit?.drafts.find(draft => draft.languageId === SOURCE_LANGUAGE_ID)?.segments || []
+    },
+    /** 整组发布的全部阻塞项：待同步、缺少对应关系或尚未核对的译文 */
+    publishBlockers(state): PublishBlocker[] {
+      const blockers: PublishBlocker[] = []
+      for (const exhibit of state.exhibits) {
+        const source = exhibit.drafts.find(draft => draft.languageId === SOURCE_LANGUAGE_ID)
+        if (!source) continue
+        for (const draft of exhibit.drafts) {
+          if (draft.languageId === SOURCE_LANGUAGE_ID) continue
+          for (const segment of draft.segments) {
+            const sync = segmentSyncState(segment, source.segments)
+            if (sync === 'verified') continue
+            blockers.push({
+              exhibitId: exhibit.id, exhibitCode: exhibit.code, exhibitTitle: exhibit.title,
+              languageId: draft.languageId, segmentId: segment.id,
+              segmentLabel: segment.label || '未命名段落', reason: sync
+            })
+          }
+          for (const sourceSegment of source.segments) {
+            const translated = draft.segments.some(segment => segment.source?.sourceSegmentId === sourceSegment.id)
+            if (!translated) {
+              blockers.push({
+                exhibitId: exhibit.id, exhibitCode: exhibit.code, exhibitTitle: exhibit.title,
+                languageId: draft.languageId, segmentId: sourceSegment.id,
+                segmentLabel: sourceSegment.label || '未命名段落', reason: 'missing-translation'
+              })
+            }
+          }
+        }
+      }
+      return blockers
+    },
+    canPublish(): boolean {
+      return this.publishBlockers.length === 0
+    },
     canUndo(state): boolean { return state.past.length > 0 },
     canRedo(state): boolean { return state.future.length > 0 }
   },
@@ -154,6 +231,7 @@ export const useScriptStore = defineStore('museum-script', {
       if (saved) {
         try {
           const data = JSON.parse(saved) as PersistedState
+          migrate(data)
           this.$patch({ ...data, hydrated: true })
           if (!this.halls.length || !this.exhibits.length) this.resetDemo()
         } catch {
@@ -166,7 +244,9 @@ export const useScriptStore = defineStore('museum-script', {
       this.hydrated = true
     },
     resetDemo() {
-      this.$patch({ ...demoState(), hydrated: true, past: [], future: [] })
+      const data = demoState()
+      migrate(data)
+      this.$patch({ ...data, hydrated: true, past: [], future: [] })
       this.persist()
       this.notice = '示例数据已就绪，可直接开始编辑。'
     },
@@ -186,7 +266,8 @@ export const useScriptStore = defineStore('museum-script', {
       const data: PersistedState = {
         halls: this.halls, exhibits: this.exhibits, versions: this.versions,
         selectedHallId: this.selectedHallId, selectedExhibitId: this.selectedExhibitId,
-        selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt
+        selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt,
+        lastPublishedAt: this.lastPublishedAt
       }
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
     },
@@ -220,26 +301,118 @@ export const useScriptStore = defineStore('museum-script', {
       this.notice = '改动已自动保存到浏览器。'
     },
     updateSegment(id: string, patch: Partial<Pick<Segment, 'label' | 'content'>>) {
-      const segment = this.selectedDraft?.segments.find(item => item.id === id)
-      if (!segment || segment.locked) return
-      this.commit(() => Object.assign(segment, patch))
+      const draft = this.selectedDraft
+      const segment = draft?.segments.find(item => item.id === id)
+      if (!draft || !segment || segment.locked) return
+      const changed = (patch.label !== undefined && patch.label !== segment.label)
+        || (patch.content !== undefined && patch.content !== segment.content)
+      if (!changed) return
+      const isSource = draft.languageId === SOURCE_LANGUAGE_ID
+      let affected: string[] = []
+      this.commit(() => {
+        Object.assign(segment, patch)
+        if (isSource) {
+          segment.revision = (segment.revision ?? 1) + 1
+          affected = this.flagStaleTranslations(this.selectedExhibitId)
+        } else if (segment.source) {
+          segment.source.verified = false
+        }
+      })
+      if (isSource) {
+        this.notice = affected.length
+          ? `中文原文已更新为 v${segment.revision}；${this.languageNames(affected)}译文已标记待同步并退回。`
+          : `中文原文已更新为 v${segment.revision}。`
+      } else if (segment.source) {
+        this.notice = '译文已修改，请重新核对并确认所依据的中文版本。'
+      }
     },
     toggleLock(id: string) {
-      const segment = this.selectedDraft?.segments.find(item => item.id === id)
-      if (!segment) return
-      this.commit(() => { segment.locked = !segment.locked })
-      this.notice = segment.locked ? '段落已锁定，避免误改。' : '段落已解锁。'
+      const draft = this.selectedDraft
+      const segment = draft?.segments.find(item => item.id === id)
+      if (!draft || !segment) return
+      const isSource = draft.languageId === SOURCE_LANGUAGE_ID
+      const unlocking = segment.locked
+      let affected: string[] = []
+      this.commit(() => {
+        segment.locked = !segment.locked
+        if (isSource && unlocking) {
+          segment.revision = (segment.revision ?? 1) + 1
+          affected = this.flagStaleTranslations(this.selectedExhibitId)
+        }
+      })
+      if (isSource && unlocking) {
+        this.notice = affected.length
+          ? `中文段落已解锁，原文升为 v${segment.revision}；${this.languageNames(affected)}译文已标记待同步并退回。`
+          : `中文段落已解锁，原文升为 v${segment.revision}。`
+      } else {
+        this.notice = segment.locked ? '段落已锁定，避免误改。' : '段落已解锁。'
+      }
     },
     addSegment() {
       const draft = this.selectedDraft
       if (!draft) return
-      this.commit(() => draft.segments.push({ id: `segment-${Date.now()}`, label: `新段落 ${draft.segments.length + 1}`, content: '', locked: false }))
+      this.commit(() => draft.segments.push({
+        id: `segment-${Date.now()}`,
+        label: `新段落 ${draft.segments.length + 1}`,
+        content: '',
+        locked: false,
+        ...(draft.languageId === SOURCE_LANGUAGE_ID ? { revision: 1 } : {})
+      }))
     },
     removeSegment(id: string) {
       const draft = this.selectedDraft
       const segment = draft?.segments.find(item => item.id === id)
       if (!draft || !segment || segment.locked) return
-      this.commit(() => { draft.segments = draft.segments.filter(item => item.id !== id) })
+      const isSource = draft.languageId === SOURCE_LANGUAGE_ID
+      let affected: string[] = []
+      this.commit(() => {
+        draft.segments = draft.segments.filter(item => item.id !== id)
+        if (isSource) affected = this.flagStaleTranslations(this.selectedExhibitId)
+      })
+      if (isSource && affected.length) {
+        this.notice = `中文段落已移除；${this.languageNames(affected)}译文已标记待同步并退回。`
+      }
+    },
+    /** 原文变动后扫描同展项译文：引用旧原文的段落进入待同步，所在稿件退回 */
+    flagStaleTranslations(exhibitId: string): string[] {
+      const exhibit = this.exhibits.find(item => item.id === exhibitId)
+      const source = exhibit?.drafts.find(draft => draft.languageId === SOURCE_LANGUAGE_ID)
+      if (!exhibit || !source) return []
+      const affected: string[] = []
+      for (const draft of exhibit.drafts) {
+        if (draft.languageId === SOURCE_LANGUAGE_ID) continue
+        const stale = draft.segments.some(segment => isStale(segmentSyncState(segment, source.segments)))
+        if (stale && (draft.status === 'approved' || draft.status === 'review')) {
+          draft.status = 'returned'
+          draft.updatedAt = new Date().toISOString()
+          affected.push(draft.languageId)
+        }
+      }
+      return affected
+    },
+    /** 译者为段落指定对应的中文原文段落 */
+    assignSource(segmentId: string, sourceSegmentId: string) {
+      const draft = this.selectedDraft
+      const segment = draft?.segments.find(item => item.id === segmentId)
+      const source = this.selectedSourceSegments.find(item => item.id === sourceSegmentId)
+      if (!draft || !segment || !source || draft.languageId === SOURCE_LANGUAGE_ID) return
+      this.commit(() => {
+        segment.source = { sourceSegmentId, sourceRevision: source.revision ?? 1, verified: false, verifiedAt: '' }
+      })
+      this.notice = '已建立对应关系，请核对译文后确认。'
+    },
+    /** 译者核对完成，记下所依据的中文版本 */
+    verifySegment(segmentId: string) {
+      const draft = this.selectedDraft
+      const segment = draft?.segments.find(item => item.id === segmentId)
+      if (!draft || !segment?.source || draft.languageId === SOURCE_LANGUAGE_ID) return
+      const source = this.selectedSourceSegments.find(item => item.id === segment.source!.sourceSegmentId)
+      if (!source) return
+      const revision = source.revision ?? 1
+      this.commit(() => {
+        segment.source = { ...segment.source!, sourceRevision: revision, verified: true, verifiedAt: new Date().toISOString() }
+      })
+      this.notice = `已核对“${segment.label || '未命名段落'}”，依据中文原文 v${revision}。`
     },
     setStatus(status: ScriptStatus) {
       const draft = this.selectedDraft
@@ -267,6 +440,7 @@ export const useScriptStore = defineStore('museum-script', {
     restoreVersion(id: string) {
       const version = this.versions.find(item => item.id === id)
       if (!version) return
+      let affected: string[] = []
       this.commit(() => {
         const exhibit = this.exhibits.find(item => item.id === version.exhibitId)
         if (!exhibit) return
@@ -274,10 +448,13 @@ export const useScriptStore = defineStore('museum-script', {
         const restored = JSON.parse(JSON.stringify(version.draft)) as LanguageDraft
         if (index >= 0) exhibit.drafts[index] = restored
         else exhibit.drafts.push(restored)
+        if (version.languageId === SOURCE_LANGUAGE_ID) affected = this.flagStaleTranslations(version.exhibitId)
       })
       this.selectedExhibitId = version.exhibitId
       this.selectedLanguageId = version.languageId
-      this.notice = '版本已恢复，并作为一次可撤销操作保存。'
+      this.notice = affected.length
+        ? `版本已恢复；${this.languageNames(affected)}译文引用的是旧原文，已标记待同步并退回。`
+        : '版本已恢复，并作为一次可撤销操作保存。'
     },
     undo() {
       const state = this.past.pop()
@@ -304,6 +481,27 @@ export const useScriptStore = defineStore('museum-script', {
       if (!draft) return 0
       const checks = [draft.title, draft.narration, draft.accessibility, draft.sources, draft.segments.length > 0 ? 'segments' : '']
       return Math.round(checks.filter(Boolean).length / checks.length * 100)
+    },
+    /** 某语言稿件中引用旧原文、等待重新同步的段落数 */
+    outOfSyncCount(exhibit: Exhibit, languageId: string): number {
+      if (languageId === SOURCE_LANGUAGE_ID) return 0
+      const source = exhibit.drafts.find(item => item.languageId === SOURCE_LANGUAGE_ID)
+      const draft = exhibit.drafts.find(item => item.languageId === languageId)
+      if (!source || !draft) return 0
+      return draft.segments.filter(segment => isStale(segmentSyncState(segment, source.segments))).length
+    },
+    languageNames(languageIds: string[]): string {
+      return languageIds.map(id => LANGUAGES.find(item => item.id === id)?.label || id).join('、')
+    },
+    /** 整组发布：存在待同步、缺少对应关系或尚未核对的译文时拒绝 */
+    publishGroup() {
+      if (this.publishBlockers.length) {
+        this.notice = `仍有 ${this.publishBlockers.length} 处译文待同步、缺少对应关系或尚未核对，无法整组发布。`
+        return
+      }
+      this.lastPublishedAt = new Date().toISOString()
+      this.persist()
+      this.notice = '整组发布完成：全部译文均已与当前中文原文核对。'
     }
   }
 })

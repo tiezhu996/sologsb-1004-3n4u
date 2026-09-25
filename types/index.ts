@@ -1,5 +1,7 @@
 export type ScriptStatus = 'draft' | 'review' | 'returned' | 'approved'
 export type DeviceKind = 'desktop' | 'tablet' | 'mobile' | 'kiosk'
+export type SegmentSyncState = 'verified' | 'unverified' | 'pending' | 'source-missing' | 'unlinked'
+export type PublishBlockReason = Exclude<SegmentSyncState, 'verified'> | 'missing-translation'
 
 export interface Hall {
   id: string
@@ -7,11 +9,33 @@ export interface Hall {
   description: string
 }
 
+/** 译文段落所依据的中文原文版本 */
+export interface SourceLink {
+  sourceSegmentId: string
+  sourceRevision: number
+  verified: boolean
+  verifiedAt: string
+}
+
 export interface Segment {
   id: string
   label: string
   content: string
   locked: boolean
+  /** 仅中文原文段落：版本号，改动或解锁时递增 */
+  revision?: number
+  /** 仅译文段落：与中文原文段落的对应关系 */
+  source?: SourceLink
+}
+
+export interface PublishBlocker {
+  exhibitId: string
+  exhibitCode: string
+  exhibitTitle: string
+  languageId: string
+  segmentId: string
+  segmentLabel: string
+  reason: PublishBlockReason
 }
 
 export interface LanguageDraft {
@@ -60,6 +84,7 @@ export interface PersistedState {
   selectedExhibitId: string
   selectedLanguageId: string
   lastSavedAt: string
+  lastPublishedAt: string
 }
 
 export interface DiffLine {

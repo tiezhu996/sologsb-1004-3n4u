@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment } from '~/types'
-import { LANGUAGES, useScriptStore } from '~/stores/script'
+import type { DeviceKind, DiffLine, LanguageDraft, PublishBlockReason, PublishBlocker, ScriptStatus, Segment, SegmentSyncState } from '~/types'
+import { LANGUAGES, SOURCE_LANGUAGE_ID, segmentSyncState, useScriptStore } from '~/stores/script'
 
 const store = useScriptStore()
 const activeTab = ref('editor')
@@ -25,9 +25,26 @@ const deviceOptions: Array<{ value: DeviceKind; label: string }> = [
   { value: 'mobile', label: '手机导览' },
   { value: 'kiosk', label: '馆内触摸屏' }
 ]
+const syncMeta: Record<SegmentSyncState, { label: string; color: string }> = {
+  verified: { label: '已核对', color: 'success' },
+  unverified: { label: '尚未核对', color: 'warning' },
+  pending: { label: '待同步 · 原文已更新', color: 'error' },
+  'source-missing': { label: '待同步 · 原文已移除', color: 'error' },
+  unlinked: { label: '缺少对应关系', color: 'grey' }
+}
+const reasonMeta: Record<PublishBlockReason, { label: string; color: string }> = {
+  pending: { label: '待同步 · 原文已更新', color: 'error' },
+  'source-missing': { label: '待同步 · 原文已移除', color: 'error' },
+  unlinked: { label: '缺少对应关系', color: 'grey' },
+  'missing-translation': { label: '缺少对应关系 · 尚未翻译此段', color: 'grey' },
+  unverified: { label: '尚未核对', color: 'warning' }
+}
 
 const draft = computed(() => store.selectedDraft)
 const exhibit = computed(() => store.selectedExhibit)
+const isSourceDraft = computed(() => draft.value?.languageId === SOURCE_LANGUAGE_ID)
+const sourceSegments = computed(() => store.selectedSourceSegments)
+const sourceOptions = computed(() => sourceSegments.value.map(item => ({ title: `${item.label || '未命名段落'}（v${item.revision ?? 1}）`, value: item.id })))
 const currentLanguage = computed(() => LANGUAGES.find(item => item.id === store.selectedLanguageId))
 const currentStatus = computed(() => statusOptions.find(item => item.value === draft.value?.status) || statusOptions[0])
 const filteredExhibits = computed(() => store.hallExhibits.filter(item => !leftFilter.value || `${item.code} ${item.title}`.toLowerCase().includes(leftFilter.value.toLowerCase())))
@@ -103,9 +120,29 @@ function buildDiff(before: string, after: string): DiffLine[] {
   return result
 }
 function formatTime(value: string) {
-  return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
 }
 function segmentLabel(segment: Segment) { return segment.label || '未命名段落' }
+function syncStateOf(segment: Segment): SegmentSyncState {
+  return segmentSyncState(segment, sourceSegments.value)
+}
+function currentSourceRevision(segment: Segment): number | null {
+  const id = segment.source?.sourceSegmentId
+  if (!id) return null
+  return sourceSegments.value.find(item => item.id === id)?.revision ?? null
+}
+function languageLabel(id: string) {
+  return LANGUAGES.find(item => item.id === id)?.label || id
+}
+function locateBlocker(blocker: PublishBlocker) {
+  const target = store.exhibits.find(item => item.id === blocker.exhibitId)
+  if (!target) return
+  store.selectedHallId = target.hallId
+  store.selectExhibit(target.id)
+  store.selectLanguage(blocker.languageId)
+  activeTab.value = 'editor'
+}
 </script>
 
 <template>
@@ -118,6 +155,18 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
         <span class="text-caption text-medium-emphasis ms-3 d-none d-md-inline">展陈脚本工作台</span>
       </v-app-bar-title>
       <v-spacer />
+      <v-chip
+        v-if="store.publishBlockers.length"
+        class="me-2"
+        color="error"
+        variant="tonal"
+        size="small"
+        role="button"
+        :aria-label="`${store.publishBlockers.length} 处译文待处理，查看整组发布`"
+        @click="activeTab = 'publish'"
+      >
+        <span class="status-dot" :style="{ background: 'currentColor' }" />{{ store.publishBlockers.length }} 处译文待处理
+      </v-chip>
       <v-chip class="me-2 d-none d-sm-flex" :color="currentStatus.color" variant="tonal" size="small">
         <span class="status-dot" :style="{ background: 'currentColor' }" />{{ currentStatus.label }}
       </v-chip>
@@ -198,6 +247,10 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
           <v-tab value="versions">版本比较</v-tab>
           <v-tab value="preview">设备预览</v-tab>
           <v-tab value="sources">资料核对</v-tab>
+          <v-tab value="publish">
+            整组发布
+            <v-chip v-if="store.publishBlockers.length" class="ms-2" color="error" size="x-small" variant="flat">{{ store.publishBlockers.length }}</v-chip>
+          </v-tab>
         </v-tabs>
 
         <div v-if="draft">
@@ -247,7 +300,9 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                     <div class="d-flex align-center justify-space-between mb-4">
                       <div>
                         <div class="section-title">分段校对</div>
-                        <div class="text-body-2 text-medium-emphasis mt-1">锁定段落不会被编辑；可在撤销中恢复。</div>
+                        <div class="text-body-2 text-medium-emphasis mt-1">
+                          {{ isSourceDraft ? '中文段落改动、解锁、移除或恢复旧快照后，引用旧原文的译文会标记待同步并退回。' : '译文需与中文原文逐段对应；核对后会记下所依据的中文版本。' }}
+                        </div>
                       </div>
                       <v-chip variant="tonal">{{ draft.segments.filter(item => item.locked).length }}/{{ draft.segments.length }} 已锁定</v-chip>
                     </div>
@@ -258,10 +313,38 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                             {{ segment.locked ? '🔒' : '🔓' }}
                           </v-btn>
                           <v-text-field :model-value="segment.label" density="compact" hide-details variant="plain" :readonly="segment.locked" :aria-label="`第 ${index + 1} 段标题`" @change="saveSegment(segment.id, 'label', $event)" />
+                          <v-chip v-if="isSourceDraft" size="small" variant="outlined" :aria-label="`原文版本 v${segment.revision ?? 1}`">原文 v{{ segment.revision ?? 1 }}</v-chip>
                           <v-chip v-if="segment.locked" color="success" size="small" variant="tonal">已确认</v-chip>
                           <v-btn icon="mdi-delete-outline" size="small" variant="text" color="error" :disabled="segment.locked" :aria-label="`删除第 ${index + 1} 段`" @click="deleteTarget = segment.id" />
                         </div>
                         <v-textarea class="mt-2" :model-value="segment.content" rows="2" auto-grow hide-details :readonly="segment.locked" :aria-label="segmentLabel(segment)" @change="saveSegment(segment.id, 'content', $event)" />
+                        <div v-if="!isSourceDraft" class="sync-bar mt-2">
+                          <v-chip :color="syncMeta[syncStateOf(segment)].color" size="small" variant="tonal">{{ syncMeta[syncStateOf(segment)].label }}</v-chip>
+                          <v-select
+                            :model-value="segment.source?.sourceSegmentId || ''"
+                            :items="sourceOptions"
+                            density="compact"
+                            hide-details
+                            variant="outlined"
+                            label="对应中文段落"
+                            style="max-width:260px"
+                            :aria-label="`第 ${index + 1} 段对应的中文段落`"
+                            @update:model-value="store.assignSource(segment.id, String($event))"
+                          />
+                          <v-btn
+                            v-if="segment.source && syncStateOf(segment) !== 'verified'"
+                            size="small"
+                            color="primary"
+                            variant="tonal"
+                            :disabled="syncStateOf(segment) === 'source-missing'"
+                            :aria-label="`核对第 ${index + 1} 段译文`"
+                            @click="store.verifySegment(segment.id)"
+                          >核对完成</v-btn>
+                          <span v-if="segment.source" class="text-caption text-medium-emphasis">
+                            依据中文 v{{ segment.source.sourceRevision }}<template v-if="currentSourceRevision(segment) !== null"> · 当前 v{{ currentSourceRevision(segment) }}</template>
+                            <template v-if="segment.source.verified && segment.source.verifiedAt"> · {{ formatTime(segment.source.verifiedAt) }} 核对</template>
+                          </span>
+                        </div>
                       </div>
                     </div>
                   </v-card>
@@ -278,6 +361,9 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                         <div class="font-weight-medium">{{ lang.label }}</div>
                         <div class="text-caption text-medium-emphasis">
                           {{ exhibit?.drafts.find(item => item.languageId === lang.id) ? store.statusLabel(exhibit!.drafts.find(item => item.languageId === lang.id)!.status) : '尚未创建' }}
+                          <span v-if="exhibit && store.outOfSyncCount(exhibit, lang.id)" class="text-error font-weight-medium">
+                            · {{ store.outOfSyncCount(exhibit, lang.id) }} 段待同步
+                          </span>
                         </div>
                       </div>
                       <v-btn size="small" variant="text" :disabled="lang.id === store.selectedLanguageId" @click="store.selectLanguage(lang.id)">切换</v-btn>
@@ -376,6 +462,48 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                   </v-card>
                 </v-col>
               </v-row>
+            </v-window-item>
+
+            <v-window-item value="publish">
+              <v-card class="script-card pa-4 pa-md-6">
+                <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-5">
+                  <div>
+                    <div class="section-title">整组发布</div>
+                    <div class="text-h6 font-weight-bold mt-1">全部展项 · 全部语言</div>
+                    <div class="text-body-2 text-medium-emphasis mt-1">
+                      只要存在待同步、缺少对应关系或尚未核对的译文，整组发布就不能继续。
+                    </div>
+                  </div>
+                  <v-btn color="primary" size="large" prepend-icon="mdi-publish" :disabled="!store.canPublish" @click="store.publishGroup">整组发布</v-btn>
+                </div>
+                <v-alert v-if="store.lastPublishedAt" class="mb-4" type="info" variant="tonal" density="compact">
+                  上次整组发布：{{ formatTime(store.lastPublishedAt) }}
+                </v-alert>
+                <v-alert v-if="store.canPublish" type="success" variant="tonal">
+                  全部译文均已与当前中文原文核对，可以整组发布。
+                </v-alert>
+                <template v-else>
+                  <v-alert type="error" variant="tonal" class="mb-4">
+                    共 {{ store.publishBlockers.length }} 处阻塞：请先处理下列展项、语言和段落，再整组发布。
+                  </v-alert>
+                  <v-list class="bg-transparent" lines="two">
+                    <v-list-item v-for="blocker in store.publishBlockers" :key="`${blocker.exhibitId}-${blocker.languageId}-${blocker.segmentId}-${blocker.reason}`" class="px-0">
+                      <template #prepend>
+                        <v-chip size="small" variant="outlined" class="me-1">{{ blocker.exhibitCode }}</v-chip>
+                      </template>
+                      <v-list-item-title class="font-weight-medium">
+                        {{ blocker.exhibitTitle }} · {{ languageLabel(blocker.languageId) }} · 段落「{{ blocker.segmentLabel }}」
+                      </v-list-item-title>
+                      <v-list-item-subtitle>
+                        <v-chip :color="reasonMeta[blocker.reason].color" size="x-small" variant="tonal" class="me-2">{{ reasonMeta[blocker.reason].label }}</v-chip>
+                      </v-list-item-subtitle>
+                      <template #append>
+                        <v-btn size="small" variant="outlined" @click="locateBlocker(blocker)">定位</v-btn>
+                      </template>
+                    </v-list-item>
+                  </v-list>
+                </template>
+              </v-card>
             </v-window-item>
           </v-window>
         </div>
